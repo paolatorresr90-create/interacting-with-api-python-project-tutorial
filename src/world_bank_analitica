@@ -1,0 +1,172 @@
+# Requerimientos y llamada a la API del Banco Mundial para obtener datos de indicadores económicos y sociales de países seleccionados, con manejo de paginación y errores. Luego, se procesan los datos en DataFrames de pandas, se visualizan con seaborn y matplotlib, y finalmente se almacenan en una base de datos SQLite utilizando SQLAlchemy.:
+
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sqlalchemy import create_engine
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+sns.set_theme(style="whitegrid")
+BASE_URL = "https://api.worldbank.org/v2"
+TIMEOUT = 60
+
+# sesión de requests con reintentos configurados para manejar errores transitorios y limitaciones de tasa de la API
+session = requests.Session()
+retry = Retry(
+    total=5,
+    connect=5,
+    read=5,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+session.mount("https://", HTTPAdapter(max_retries=retry))
+session.mount("http://", HTTPAdapter(max_retries=retry))
+
+# Exploración de la API para obtener la lista de países disponibles
+
+url = f"{BASE_URL}/country"
+params = {
+    "format": "json",
+    "per_page": 50,
+    "page": 1,
+}
+
+response = session.get(url, params=params, timeout=TIMEOUT)
+response.raise_for_status()
+payload = response.json()
+
+print("Pagination metadata:", payload[0])
+print("First country record:", payload[1][0])
+
+# Selección de países y indicadores para el análisis
+
+countries = ["ARG", "BRA", "CHL", "BOL", "COL"]
+indicators = {
+    "NY.GDP.PCAP.CD": "gdp_per_capita",
+    "SP.DYN.LE00.IN": "life_expectancy",
+    "SP.POP.TOTL": "population",
+}
+
+def fetch_indicator_data(country_codes, indicator_id, start_year=2010, end_year=2024):
+    country_path = ";".join(country_codes)
+    endpoint = f"{BASE_URL}/country/{country_path}/indicator/{indicator_id}"
+    page = 1
+    all_rows = []
+
+    while True:
+        params = {
+            "format": "json",
+            "date": f"{start_year}:{end_year}",
+            "per_page": 50,
+            "page": page,
+        }
+
+        response = session.get(endpoint, params=params, timeout=TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+
+        if not isinstance(payload, list) or len(payload) == 0:
+            raise ValueError(f"Unexpected API response for {indicator_id}: {payload}")
+
+        metadata = payload[0]
+        rows = payload[1] if len(payload) > 1 and payload[1] is not None else []
+        all_rows.extend(rows)
+
+        total_pages = int(metadata.get("pages", 1))
+        if page >= total_pages:
+            break
+        page += 1
+
+    return all_rows
+
+tables = {}
+
+for indicator_id, table_name in indicators.items():
+    raw_rows = fetch_indicator_data(countries, indicator_id, 2010, 2024)
+    
+    records = []
+    for row in raw_rows:
+        # Validación: solo agregar si existen los datos necesarios
+        if "country" in row and "date" in row:
+            records.append({
+                "country": row["country"]["value"],
+                "year": row["date"],
+                "value": row["value"],
+            })
+
+    # Crear el DataFrame solo si hay registros
+    if records:
+        df = pd.DataFrame(records)
+        
+        # Verificamos que las columnas existan antes de transformar
+        if "year" in df.columns:
+            df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            
+            # Limpieza y ordenado
+            df = df.dropna(subset=["value", "year"]).copy()
+            df["year"] = df["year"].astype(int)
+            df = df.sort_values(["country", "year"]).reset_index(drop=True)
+            
+            tables[table_name] = df
+        else:
+            print(f"Advertencia: La columna 'year' no se encontró para {table_name}")
+    else:
+        print(f"Advertencia: No se encontraron datos para el indicador {table_name}")
+
+
+# Visualización de los datos para cada indicador utilizando seaborn y matplotlib
+
+
+# 1. Gráfico de líneas (PIB)
+if "gdp_per_capita" in tables:
+    plt.figure(figsize=(12, 6))
+    sns.lineplot(data=tables["gdp_per_capita"], x="year", y="value", hue="country", marker="o")
+    plt.title("GDP per capita (2010-2024)")
+    plt.show()
+
+# --- SECCIÓN DE VISUALIZACIÓN ---
+latest_year = 2022 
+
+if "gdp_per_capita" in tables and "population" in tables:
+    gdp_latest = tables["gdp_per_capita"].query("year == @latest_year").rename(columns={"value": "gdp_per_capita"})
+    pop_latest = tables["population"].query("year == @latest_year").rename(columns={"value": "population"})
+
+    merged = pd.merge(
+        gdp_latest[["country", "gdp_per_capita"]],
+        pop_latest[["country", "population"]],
+        on="country",
+        how="inner"
+    )
+
+    if not merged.empty:
+        plt.figure(figsize=(10, 6))
+        sns.scatterplot(data=merged, x="gdp_per_capita", y="population", hue="country", s=120)
+        plt.title(f"GDP vs Población ({latest_year})")
+        
+        # ESTO GUARDA LA IMAGEN EN TU CARPETA
+        plt.savefig("grafico_gdp_vs_poblacion.png")
+        print("Imagen guardada como 'grafico_gdp_vs_poblacion.png'")
+        
+        plt.show() # Esto intentará abrir la ventana
+    else:
+        print(f"No hay datos para unir en el año {latest_year}")
+
+# --- CARGA A SQL (VERSIÓN 2026 COMPATIBLE) ---
+engine = create_engine("sqlite:///world_bank_analysis.db")
+
+# En lugar de usar 'with', pasamos el motor directamente a to_sql.
+# Pandas se encargará de abrir y cerrar la conexión correctamente.
+for table_name, df in tables.items():
+    sql_table_name = f"indicator_{table_name}"
+    # Usar el engine directamente es lo más seguro en versiones nuevas
+    df.to_sql(sql_table_name, con=engine, if_exists="replace", index=False)
+    print(f"Éxito: Tabla {sql_table_name} guardada.")
+
+# Validación de lectura
+print("\nVerificación de datos en la DB:")
+df_valid = pd.read_sql(f"SELECT * FROM indicator_gdp_per_capita LIMIT 5", con=engine)
+print(df_valid)
