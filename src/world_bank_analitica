@@ -155,18 +155,25 @@ if "gdp_per_capita" in tables and "population" in tables:
     else:
         print(f"No hay datos para unir en el año {latest_year}")
 
-# --- CARGA A SQL (VERSIÓN 2026 COMPATIBLE) ---
-engine = create_engine("sqlite:///world_bank_analysis.db")
+# --- CARGA A SQL (SOLUCIÓN FINAL COMPATIBLE) ---
+# --- CARGA A SQL (ESTA VEZ SIN FALLOS) ---
+import sqlite3
 
-# En lugar de usar 'with', pasamos el motor directamente a to_sql.
-# Pandas se encargará de abrir y cerrar la conexión correctamente.
+# Creamos la base de datos (o la abrimos si ya existe)
+db_name = "world_bank_analysis.db"
+conn = sqlite3.connect(db_name)
+
 for table_name, df in tables.items():
     sql_table_name = f"indicator_{table_name}"
-    # Usar el engine directamente es lo más seguro en versiones nuevas
-    df.to_sql(sql_table_name, con=engine, if_exists="replace", index=False)
-    print(f"Éxito: Tabla {sql_table_name} guardada.")
+    
+    # Pandas puede usar la conexión de sqlite3 directamente sin SQLAlchemy
+    df.to_sql(sql_table_name, conn, if_exists="replace", index=False)
+    print(f"Éxito: Tabla {sql_table_name} guardada correctamente.")
 
-# Validación de lectura
-print("\nVerificación de datos en la DB:")
-df_valid = pd.read_sql(f"SELECT * FROM indicator_gdp_per_capita LIMIT 5", con=engine)
+# Validación rápida
+print("\nVerificando datos guardados:")
+df_valid = pd.read_sql(f"SELECT * FROM indicator_gdp_per_capita LIMIT 5", conn)
 print(df_valid)
+
+# Cerramos la conexión
+conn.close()
